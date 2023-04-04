@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import os
 import random
-import requests
 import time
 import logging
 import argparse
@@ -18,6 +17,12 @@ from pms5003 import PMS5003, ReadTimeoutError as pmsReadTimeoutError, SerialTime
 from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
 
+# LCD stuff
+import ST7735
+from PIL import Image
+from PIL import ImageDraw
+from PIL import ImageFont
+from fonts.ttf import RobotoMedium as UserFont
 
 try:
     from smbus2 import SMBus
@@ -38,11 +43,7 @@ logging.basicConfig(
               logging.StreamHandler()],
     datefmt='%Y-%m-%d %H:%M:%S')
 
-logging.info("""enviroplus_exporter.py - Expose readings from the Enviro+ sensor by Pimoroni in Prometheus format
-
-Press Ctrl+C to exit!
-
-""")
+logging.info("enviroplus_exporter.py - Expose readings from the Enviro+ sensor by Pimoroni in Prometheus format. Press Ctrl+C to exit")
 
 DEBUG = os.getenv('DEBUG', 'false') == 'true'
 
@@ -52,6 +53,16 @@ try:
     pms5003 = PMS5003()
 except serial.serialutil.SerialException:
     logging.warning("Failed to initialise PMS5003.")
+
+# Create ST7735 LCD display class
+st7735 = ST7735.ST7735(
+    port=0,
+    cs=1,
+    dc=9,
+    backlight=12,
+    rotation=270,
+    spi_speed_hz=10000000
+)
 
 TEMPERATURE = Gauge('temperature','Temperature measured (*C)')
 PRESSURE = Gauge('pressure','Pressure measured (hPa)')
@@ -84,17 +95,13 @@ INFLUXDB_TIME_BETWEEN_POSTS = int(os.getenv('INFLUXDB_TIME_BETWEEN_POSTS', '5'))
 influxdb_client = InfluxDBClient(url=INFLUXDB_URL, token=INFLUXDB_TOKEN, org=INFLUXDB_ORG_ID)
 influxdb_api = influxdb_client.write_api(write_options=SYNCHRONOUS)
 
-# Setup Luftdaten
-LUFTDATEN_TIME_BETWEEN_POSTS = int(os.getenv('LUFTDATEN_TIME_BETWEEN_POSTS', '30'))
-
-# Sometimes the sensors can't be read. Resetting the i2c 
 def reset_i2c():
+    """Sometimes the sensors can't be read. Resetting the i2c"""
     subprocess.run(['i2cdetect', '-y', '1'])
     time.sleep(2)
 
-
-# Get the temperature of the CPU for compensation
 def get_cpu_temperature():
+    """Get the temperature of the CPU for compensation"""
     with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
         temp = f.read()
         temp = int(temp) / 1000.0
@@ -116,7 +123,10 @@ def get_temperature(factor):
     else:
         temperature = raw_temp
 
-    TEMPERATURE.set(temperature)   # Set to a given value
+    # convert it to F
+    ftemperature = temperature * 1.80000 + 32.00
+
+    TEMPERATURE.set(ftemperature)   # Set to a given value
 
 def get_pressure():
     """Get pressure from the weather sensor"""
@@ -141,14 +151,14 @@ def get_gas():
     try:
         readings = gas.read_all()
 
-        OXIDISING.set(readings.oxidising)
-        OXIDISING_HIST.observe(readings.oxidising)
+        OXIDISING.set(readings.oxidising / 1000)
+        OXIDISING_HIST.observe(readings.oxidising / 1000)
 
-        REDUCING.set(readings.reducing)
-        REDUCING_HIST.observe(readings.reducing)
+        REDUCING.set(readings.reducing / 1000)
+        REDUCING_HIST.observe(readings.reducing / 1000)
 
-        NH3.set(readings.nh3)
-        NH3_HIST.observe(readings.nh3)
+        NH3.set(readings.nh3 / 1000)
+        NH3_HIST.observe(readings.nh3 / 1000)
     except IOError:
         logging.error("Could not get gas readings. Resetting i2c.")
         reset_i2c()
@@ -188,20 +198,73 @@ def collect_all_data():
     sensor_data['temperature'] = TEMPERATURE.collect()[0].samples[0].value
     sensor_data['humidity'] = HUMIDITY.collect()[0].samples[0].value
     sensor_data['pressure'] = PRESSURE.collect()[0].samples[0].value
-    sensor_data['oxidising'] = OXIDISING.collect()[0].samples[0].value
-    sensor_data['reducing'] = REDUCING.collect()[0].samples[0].value
-    sensor_data['nh3'] = NH3.collect()[0].samples[0].value
     sensor_data['lux'] = LUX.collect()[0].samples[0].value
     sensor_data['proximity'] = PROXIMITY.collect()[0].samples[0].value
-    sensor_data['pm1'] = PM1.collect()[0].samples[0].value
-    sensor_data['pm25'] = PM25.collect()[0].samples[0].value
-    sensor_data['pm10'] = PM10.collect()[0].samples[0].value
+    sensor_data['oxidising'] = OXIDISING.collect()[0].samples[0].value
+    sensor_data['reducing'] = REDUCING.collect()[0].samples[0].value
+    sensor_data['nh3'] = NH3.collect()[0].samples[0].value        
+    
+    if args.gas:
+        sensor_data['pm1'] = PM1.collect()[0].samples[0].value
+        sensor_data['pm10'] = PM10.collect()[0].samples[0].value
+        sensor_data['pm25'] = PM25.collect()[0].samples[0].value
+
+    display_everything(sensor_data)
     return sensor_data
+
+def display_everything(sensor_data):
+    """Displays all the current sensor data on the 0.96" LCD"""
+    # Initialize display
+    st7735.begin()
+
+    WIDTH = st7735.width
+    HEIGHT = st7735.height
+
+    # Set up canvas and font
+    img = Image.new('RGB', (WIDTH, HEIGHT), color=(0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    font_size_small = 10
+    font_size_large = 20
+    font = ImageFont.truetype(UserFont, font_size_large)
+    smallfont = ImageFont.truetype(UserFont, font_size_small)
+    x_offset = 2
+    y_offset = 2
+
+    units = {
+        "temperature": "f",
+        "pressure": "hPa",
+        "humidity": "%",
+        "lux": "",
+        "proximity": "",
+        "oxidising": "k0",
+        "reducing": "k0",
+        "nh3": "k0",
+        "pm1": "ug/m3",
+        "pm25": "ug/m3",
+        "pm10": "ug/m3"
+    }
+
+    draw.rectangle((0, 0, WIDTH, HEIGHT), (0, 0, 0))
+    column_count = 2
+    row_count = (len(sensor_data) / column_count)
+    print(WIDTH, HEIGHT)
+    count = 0
+    for i in sensor_data:
+        variable = i
+        data_value = round(sensor_data[variable], 1)
+        print(variable, data_value)
+    
+        x = x_offset + ((WIDTH // column_count) * (count // row_count))
+        y = y_offset + ((HEIGHT / row_count) * (count % row_count))
+        message = "{}: {:.1f} {}".format(variable[:4], data_value, units[variable])
+        draw.text((x, y), message, font=smallfont, fill=(0, 255, 255))
+        count += 1
+    st7735.display(img)
 
 def post_to_influxdb():
     """Post all sensor data to InfluxDB"""
     name = 'enviroplus'
-    tag = ['location', 'adelaide']
+    tag = ['location', 'akron']
     while True:
         time.sleep(INFLUXDB_TIME_BETWEEN_POSTS)
         data_points = []
@@ -216,65 +279,6 @@ def post_to_influxdb():
         except Exception as exception:
             logging.warning('Exception sending to InfluxDB: {}'.format(exception))
 
-def post_to_luftdaten():
-    """Post relevant sensor data to luftdaten.info"""
-    """Code from: https://github.com/sepulworld/balena-environ-plus"""
-    LUFTDATEN_SENSOR_UID = 'raspi-' + get_serial_number()
-    while True:
-        time.sleep(LUFTDATEN_TIME_BETWEEN_POSTS)
-        sensor_data = collect_all_data()
-        values = {}
-        values["P2"] = sensor_data['pm25']
-        values["P1"] = sensor_data['pm10']
-        values["temperature"] = "{:.2f}".format(sensor_data['temperature'])
-        values["pressure"] = "{:.2f}".format(sensor_data['pressure'] * 100)
-        values["humidity"] = "{:.2f}".format(sensor_data['humidity'])
-        pm_values = dict(i for i in values.items() if i[0].startswith('P'))
-        temperature_values = dict(i for i in values.items() if not i[0].startswith('P'))
-        try:
-            response_pin_1 = requests.post('https://api.luftdaten.info/v1/push-sensor-data/',
-                json={
-                    "software_version": "enviro-plus 0.0.1",
-                    "sensordatavalues": [{"value_type": key, "value": val} for
-                                        key, val in pm_values.items()]
-                },
-                headers={
-                    "X-PIN":    "1",
-                    "X-Sensor": LUFTDATEN_SENSOR_UID,
-                    "Content-Type": "application/json",
-                    "cache-control": "no-cache"
-                }
-            )
-
-            response_pin_11 = requests.post('https://api.luftdaten.info/v1/push-sensor-data/',
-                    json={
-                        "software_version": "enviro-plus 0.0.1",
-                        "sensordatavalues": [{"value_type": key, "value": val} for
-                                            key, val in temperature_values.items()]
-                    },
-                    headers={
-                        "X-PIN":    "11",
-                        "X-Sensor": LUFTDATEN_SENSOR_UID,
-                        "Content-Type": "application/json",
-                        "cache-control": "no-cache"
-                    }
-            )
-
-            if response_pin_1.ok and response_pin_11.ok:
-                if DEBUG:
-                    logging.info('Luftdaten response: OK')
-            else:
-                logging.warning('Luftdaten response: Failed')
-        except Exception as exception:
-            logging.warning('Exception sending to Luftdaten: {}'.format(exception))
-
-def get_serial_number():
-    """Get Raspberry Pi serial number to use as LUFTDATEN_SENSOR_UID"""
-    with open('/proc/cpuinfo', 'r') as f:
-        for line in f:
-            if line[0:6] == 'Serial':
-                return str(line.split(":")[1].strip())
-
 def str_to_bool(value):
     if value.lower() in {'false', 'f', '0', 'no', 'n'}:
         return False
@@ -288,10 +292,9 @@ if __name__ == '__main__':
     parser.add_argument("-b", "--bind", metavar='ADDRESS', default='0.0.0.0', help="Specify alternate bind address [default: 0.0.0.0]")
     parser.add_argument("-p", "--port", metavar='PORT', default=8000, type=int, help="Specify alternate port [default: 8000]")
     parser.add_argument("-f", "--factor", metavar='FACTOR', type=float, help="The compensation factor to get better temperature results when the Enviro+ pHAT is too close to the Raspberry Pi board")
-    parser.add_argument("-e", "--enviro", metavar='ENVIRO', type=str_to_bool, help="Device is an Enviro (not Enviro+) so don't fetch data from gas and particulate sensors as they don't exist")
+    parser.add_argument("-g", "--gas", metavar='ENVIRO', default=False, type=str_to_bool, help="Fetch data from gas and particulate sensors, if they exist")
     parser.add_argument("-d", "--debug", metavar='DEBUG', type=str_to_bool, help="Turns on more verbose logging, showing sensor output and post responses [default: false]")
     parser.add_argument("-i", "--influxdb", metavar='INFLUXDB', type=str_to_bool, default='false', help="Post sensor data to InfluxDB [default: false]")
-    parser.add_argument("-l", "--luftdaten", metavar='LUFTDATEN', type=str_to_bool, default='false', help="Post sensor data to Luftdaten [default: false]")
     args = parser.parse_args()
 
     # Start up the server to expose the metrics.
@@ -310,13 +313,6 @@ if __name__ == '__main__':
         influx_thread = Thread(target=post_to_influxdb)
         influx_thread.start()
 
-    if args.luftdaten:
-        # Post to Luftdaten in another thread
-        LUFTDATEN_SENSOR_UID = 'raspi-' + get_serial_number()
-        logging.info("Sensor data will be posted to Luftdaten every {} seconds for the UID {}".format(LUFTDATEN_TIME_BETWEEN_POSTS, LUFTDATEN_SENSOR_UID))
-        luftdaten_thread = Thread(target=post_to_luftdaten)
-        luftdaten_thread.start()
-
     logging.info("Listening on http://{}:{}".format(args.bind, args.port))
 
     while True:
@@ -324,8 +320,13 @@ if __name__ == '__main__':
         get_pressure()
         get_humidity()
         get_light()
-        if not args.enviro:
+        
+        if args.gas:
             get_gas()
             get_particulates()
+        
+        data = collect_all_data()
+        
         if DEBUG:
-            logging.info('Sensor data: {}'.format(collect_all_data()))
+            logging.info('Sensor data: {}'.format(data))
+        

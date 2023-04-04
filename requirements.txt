@@ -4,4 +4,3 @@ pimoroni-bme280>=0.0.2
 enviroplus>=0.0.3
 RPi.GPIO>=0.7.0
 smbus>=1.1.post2
-requests>=2.24.0
